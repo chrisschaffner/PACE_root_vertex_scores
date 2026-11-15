@@ -2045,9 +2045,18 @@ int main(int argc, char *argv[])
         }
     }
 
+    fprintf(stderr, "Graph loaded: n=%d, edges=%d\n", n, num_edges_read);
+    fflush(stderr);
+
     int *saved_parent = calloc(n, sizeof *saved_parent);
 
+    fprintf(stderr, "Starting heuristic presolve...\n");
+    fflush(stderr);
+
     int best_heuristic_depth = heuristic_presolve(n, g, saved_parent);
+
+    fprintf(stderr, "Heuristic presolve finished: depth=%d\n", best_heuristic_depth);
+    fflush(stderr);
 
     struct Dom dom;
     dom.adj_vv_dominated_by = malloc(n * sizeof *dom.adj_vv_dominated_by);

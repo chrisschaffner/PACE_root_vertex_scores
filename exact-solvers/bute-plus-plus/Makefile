@@ -1,7 +1,14 @@
+METIS_PREFIX := $(shell brew --prefix metis)
+
+CC = clang
+CFLAGS = -O3 -g -Wall -Wpedantic -Werror=vla
+INCLUDES = -I../include -I$(METIS_PREFIX)/include
+LIBS = -L$(METIS_PREFIX)/lib -lmetis -lm
+
 all: solve
 
-solve: solve.c ../include/bitset.h
-	${CC} -O3 -g -ggdb -Wall -Wpedantic -Werror=vla -I../include -o solve solve.c naurng.c libmetis.a -mpopcnt -lm
+solve: solve.c naurng.c ../include/bitset.h
+	$(CC) $(CFLAGS) $(INCLUDES) -o solve solve.c naurng.c $(LIBS)
 
 clean:
 	rm -f solve
