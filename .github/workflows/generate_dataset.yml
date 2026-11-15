@@ -1,0 +1,125 @@
+name: Generate Treedepth Dataset
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    name: Discover input graphs
+    runs-on: ubuntu-latest
+
+    outputs:
+      batches: ${{ steps.discover.outputs.batches }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Find and batch graphs
+        id: discover
+        shell: bash
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          from pathlib import Path
+
+          input_dir = Path("exact-solvers/bute-plus-plus/input")
+
+          graphs = sorted(
+              p.name for p in input_dir.glob("*.gr")
+              if p.is_file()
+          )
+
+          if not graphs:
+              raise SystemExit("No .gr files found in input directory")
+
+          batch_size = 20
+
+          batches = [
+              {
+                  "id": i // batch_size,
+                  "graphs": graphs[i:i + batch_size]
+              }
+              for i in range(0, len(graphs), batch_size)
+          ]
+
+          print("batches=" + json.dumps(batches))
+          PY
+
+  generate:
+    name: Generate batch ${{ matrix.batch.id }}
+    needs: discover
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        batch: ${{ fromJson(needs.discover.outputs.batches) }}
+
+    defaults:
+      run:
+        working-directory: exact-solvers/bute-plus-plus
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libmetis-dev
+
+      - name: Compile executables
+        run: |
+          gcc -O3 -I../../include \
+            -o solve solve.c naurng.c \
+            -lmetis -mpopcnt -lm
+
+          gcc -O3 -I../../include \
+            -o vertex_quality vertex_quality.c naurng.c \
+            -lmetis -mpopcnt -lm
+
+      - name: Generate vertex scores
+        shell: bash
+        env:
+          GRAPH_FILES: ${{ toJson(matrix.batch.graphs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          graphs = json.loads(os.environ["GRAPH_FILES"])
+
+          for graph in graphs:
+              print(f"Processing {graph}", flush=True)
+
+              subprocess.run(
+                  [
+                      "python3",
+                      "label_subgraphs.py",
+                      f"input/{graph}",
+                      "raw/train",
+                      "--scorer",
+                      "./vertex_quality",
+                      "--solver",
+                      "./solve",
+                  ],
+                  check=True,
+              )
+          PY
+
+      - name: Upload generated dataset
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dataset-batch-${{ matrix.batch.id }}
+          path: exact-solvers/bute-plus-plus/output/raw/train/
+          retention-days: 30
+          if-no-files-found: warn
