@@ -36,7 +36,8 @@ jobs:
           if not graphs:
               raise SystemExit("No .gr files found in input directory")
 
-          batch_size = 20
+          # One graph per GitHub Actions job
+          batch_size = 1
 
           batches = [
               {
@@ -46,6 +47,12 @@ jobs:
               for i in range(0, len(graphs), batch_size)
           ]
 
+          if len(batches) > 256:
+              raise SystemExit(
+                  "Too many jobs for one matrix. "
+                  "Increase batch_size or split the workflow."
+              )
+
           print("batches=" + json.dumps(batches))
           PY
 
@@ -53,6 +60,9 @@ jobs:
     name: Generate batch ${{ matrix.batch.id }}
     needs: discover
     runs-on: ubuntu-latest
+
+    # Keep below GitHub's 6-hour job limit
+    timeout-minutes: 330
 
     strategy:
       fail-fast: false
@@ -87,6 +97,7 @@ jobs:
 
       - name: Generate vertex scores
         shell: bash
+        timeout-minutes: 315
         env:
           GRAPH_FILES: ${{ toJson(matrix.batch.graphs) }}
         run: |
@@ -94,26 +105,62 @@ jobs:
           import json
           import os
           import subprocess
+          import time
 
           graphs = json.loads(os.environ["GRAPH_FILES"])
 
           for graph in graphs:
-              print(f"Processing {graph}", flush=True)
+              print("=" * 60, flush=True)
+              print(f"Processing graph: {graph}", flush=True)
+              print("=" * 60, flush=True)
 
-              subprocess.run(
-                  [
-                      "python3",
-                      "label_subgraphs.py",
-                      f"input/{graph}",
-                      "raw/train",
-                      "--scorer",
-                      "./vertex_quality",
-                      "--solver",
-                      "./solve",
-                  ],
-                  check=True,
-              )
+              start = time.monotonic()
+
+              try:
+                  subprocess.run(
+                      [
+                          "python3",
+                          "-u",
+                          "label_subgraphs.py",
+                          f"input/{graph}",
+                          "raw/train",
+                          "--scorer",
+                          "./vertex_quality",
+                          "--solver",
+                          "./solve",
+                      ],
+                      check=True,
+                  )
+
+                  elapsed = time.monotonic() - start
+
+                  print(
+                      f"SUCCESS: {graph} "
+                      f"completed in {elapsed:.1f}s",
+                      flush=True,
+                  )
+
+              except subprocess.CalledProcessError as error:
+                  elapsed = time.monotonic() - start
+
+                  print(
+                      f"FAILED: {graph} "
+                      f"after {elapsed:.1f}s "
+                      f"(exit code {error.returncode})",
+                      flush=True,
+                  )
+
+                  raise
           PY
+
+      - name: Show generated files
+        if: always()
+        run: |
+          echo "Generated files:"
+          find output -type f 2>/dev/null | head -100 || true
+
+          echo "Total files:"
+          find output -type f 2>/dev/null | wc -l || true
 
       - name: Upload generated dataset
         if: always()
