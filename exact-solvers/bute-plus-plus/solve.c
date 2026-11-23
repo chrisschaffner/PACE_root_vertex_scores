@@ -2050,12 +2050,14 @@ int main(int argc, char *argv[])
 
     int *saved_parent = calloc(n, sizeof *saved_parent);
 
-    fprintf(stderr, "Starting heuristic presolve...\n");
-    fflush(stderr);
+    /* A chain is a valid decomposition with depth n.
+    The exact search below tests all smaller depths. */
+    int best_heuristic_depth = n;
+    for (int i = 0; i < n; i++) {
+        saved_parent[i] = i - 1;
+    }
 
-    int best_heuristic_depth = heuristic_presolve(n, g, saved_parent);
-
-    fprintf(stderr, "Heuristic presolve finished: depth=%d\n", best_heuristic_depth);
+    fprintf(stderr, "Heuristic presolve skipped; starting exact search.\n");
     fflush(stderr);
 
     struct Dom dom;
