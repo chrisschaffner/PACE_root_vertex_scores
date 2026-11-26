@@ -138,7 +138,9 @@ def save_scores(path, vertices, scores, chosen_root):
 def label_subgraphs(graph_path, output_dir, scorer, solver):
     adjacency = read_pace_graph(graph_path)
     components = list(connected_components(adjacency, adjacency))
-    output_dir.mkdir(parents=True, exist_ok=False)
+
+    # Existing output directories are allowed when resuming.
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     if len(components) == 1:
         initial_states = [("root", components[0])]
@@ -152,24 +154,110 @@ def label_subgraphs(graph_path, output_dir, scorer, solver):
 
     while pending:
         state_id, vertices = pending.pop()
+        vertex_set = set(vertices)
+
         state_graph = output_dir / f"{state_id}.gr"
         state_scores = output_dir / f"{state_id}.csv"
 
-        save_graph(state_graph, adjacency, vertices)
-        print(f"Scoring {state_graph} ({len(vertices)} vertices)", flush=True)
-        scores = calculate_scores(state_graph, len(vertices), scorer, solver)
+        # Build the expected graph using local IDs.
+        local_ids = {
+            vertex: i
+            for i, vertex in enumerate(vertices, start=1)
+        }
+        expected_graph = {
+            local_ids[vertex]: {
+                local_ids[neighbor]
+                for neighbor in adjacency[vertex] & vertex_set
+            }
+            for vertex in vertices
+        }
 
-        # Choose the lowest score, then the smallest original vertex ID.
+        # Check restored graph files against the current input.
+        if state_graph.exists():
+            if read_pace_graph(state_graph) != expected_graph:
+                raise ValueError(
+                    f"Checkpoint graph differs from current input: {state_graph}"
+                )
+        elif state_scores.exists():
+            raise ValueError(
+                f"Checkpoint scores have no matching graph: {state_scores}"
+            )
+        else:
+            save_graph(state_graph, adjacency, vertices)
+
+        if state_scores.exists():
+            scores = read_saved_scores(state_scores, vertices)
+            print(f"REUSE: {state_scores}", flush=True)
+        else:
+            print(
+                f"SCORING: {state_graph} "
+                f"({len(vertices)} vertices)",
+                flush=True,
+            )
+
+            scores = calculate_scores(
+                state_graph, len(vertices), scorer, solver
+            )
+
+            _, chosen_root = min(zip(scores, vertices))
+
+            # Write to a temporary file, then publish the complete CSV.
+            temporary = state_scores.with_suffix(".csv.tmp")
+            save_scores(temporary, vertices, scores, chosen_root)
+            temporary.replace(state_scores)
+
+        # Reconstruct the same deterministic root choices when resuming.
         _, chosen_root = min(zip(scores, vertices))
-        save_scores(state_scores, vertices, scores, chosen_root)
+        remaining = vertex_set - {chosen_root}
 
-        remaining = set(vertices) - {chosen_root}
         children = list(connected_components(adjacency, remaining))
         child_states = [
             (f"{state_id}-{i}", child)
             for i, child in enumerate(children, start=1)
         ]
         pending.extend(reversed(child_states))
+
+    print(f"COMPLETE: {graph_path}", flush=True)
+
+def read_saved_scores(path, vertices):
+    with path.open(encoding="utf-8", newline="") as file:
+        reader = csv.DictReader(file)
+
+        expected_columns = [
+            "vertex", "original_vertex", "quality", "chosen"
+        ]
+        if reader.fieldnames != expected_columns:
+            raise ValueError(f"Invalid checkpoint header: {path}")
+
+        rows = list(reader)
+
+    if len(rows) != len(vertices):
+        raise ValueError(f"Incomplete checkpoint: {path}")
+
+    by_id = {}
+    for row in rows:
+        vertex = int(row["vertex"])
+        if vertex in by_id:
+            raise ValueError(f"Duplicate vertex in checkpoint: {path}")
+        by_id[vertex] = row
+
+    if set(by_id) != set(range(1, len(vertices) + 1)):
+        raise ValueError(f"Invalid vertex IDs in checkpoint: {path}")
+
+    scores = []
+    for local_id, original_id in enumerate(vertices, start=1):
+        row = by_id[local_id]
+
+        if int(row["original_vertex"]) != original_id:
+            raise ValueError(f"Vertex mapping mismatch: {path}")
+
+        quality = int(row["quality"])
+        if not 1 <= quality <= len(vertices):
+            raise ValueError(f"Invalid quality in checkpoint: {path}")
+
+        scores.append(quality)
+
+    return scores
 
 
 def main():
@@ -217,11 +305,6 @@ def main():
 
         else:
             parser.error(f"Input path does not exist: {args.input}")
-
-        # Prevent overwriting existing results.
-        for _, output_dir in jobs:
-            if output_dir.exists():
-                parser.error(f"Output path already exists: {output_dir}")
 
         # Process each original graph.
         for graph, output_dir in jobs:
