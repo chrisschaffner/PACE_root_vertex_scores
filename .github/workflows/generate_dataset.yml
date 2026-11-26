@@ -2,9 +2,16 @@ name: Generate Treedepth Dataset
 
 on:
   workflow_dispatch:
+    inputs:
+      resume_run_id:
+        description: "Previous run ID containing results; leave empty to start fresh"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   discover:
@@ -18,7 +25,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Find and batch graphs
+      - name: Find graphs
         id: discover
         shell: bash
         run: |
@@ -27,7 +34,6 @@ jobs:
           from pathlib import Path
 
           input_dir = Path("exact-solvers/bute-plus-plus/input")
-
           graphs = sorted(
               p.name for p in input_dir.glob("*.gr")
               if p.is_file()
@@ -36,32 +42,21 @@ jobs:
           if not graphs:
               raise SystemExit("No .gr files found in input directory")
 
-          # One graph per GitHub Actions job
-          batch_size = 1
+          if len(graphs) > 256:
+              raise SystemExit("More than 256 input graphs; split the workflow")
 
           batches = [
-              {
-                  "id": i // batch_size,
-                  "graphs": graphs[i:i + batch_size]
-              }
-              for i in range(0, len(graphs), batch_size)
+              {"id": i, "graph": graph}
+              for i, graph in enumerate(graphs)
           ]
-
-          if len(batches) > 256:
-              raise SystemExit(
-                  "Too many jobs for one matrix. "
-                  "Increase batch_size or split the workflow."
-              )
 
           print("batches=" + json.dumps(batches))
           PY
 
   generate:
-    name: Generate batch ${{ matrix.batch.id }}
+    name: Generate ${{ matrix.batch.graph }}
     needs: discover
     runs-on: ubuntu-latest
-
-    # Keep below GitHub's 6-hour job limit
     timeout-minutes: 330
 
     strategy:
@@ -78,12 +73,144 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Restore saved states
+        id: restore
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CURRENT_RUN: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          PREVIOUS_RUN: ${{ inputs.resume_run_id }}
+          GRAPH_FILE: ${{ matrix.batch.graph }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import shutil
+          import subprocess
+          import tempfile
+          from pathlib import Path
+
+          repo = os.environ["GH_REPO"]
+          current_run = os.environ["CURRENT_RUN"]
+          previous_run = os.environ.get("PREVIOUS_RUN", "").strip()
+          attempt = int(os.environ["RUN_ATTEMPT"])
+          graph_name = Path(os.environ["GRAPH_FILE"]).stem
+          destination = Path("output/raw/train") / graph_name
+
+          if previous_run and not previous_run.isdecimal():
+              raise SystemExit("resume_run_id must be a numeric run ID")
+
+          # Prefer checkpoints from this run's previous attempts.
+          runs = []
+          if attempt > 1:
+              runs.append(current_run)
+          if previous_run and previous_run not in runs:
+              runs.append(previous_run)
+
+          artifact_pattern = re.compile(
+              rf"dataset-{re.escape(os.environ['GRAPH_FILE'])}-attempt-(\d+)"
+          )
+
+          def list_artifacts(run_id):
+              endpoint = f"repos/{repo}/actions/runs/{run_id}/artifacts"
+              response = subprocess.check_output(
+                  ["gh", "api", "--paginate", "--slurp", endpoint],
+                  text=True,
+              )
+              pages = json.loads(response)
+              return [
+                  artifact
+                  for page in pages
+                  for artifact in page["artifacts"]
+                  if not artifact["expired"]
+              ]
+
+          restored = False
+
+          for run_id in runs:
+              artifacts = list_artifacts(run_id)
+              matching = []
+
+              for artifact in artifacts:
+                  match = artifact_pattern.fullmatch(artifact["name"])
+                  if match:
+                      matching.append(
+                          (int(match.group(1)), artifact["name"])
+                      )
+
+              if matching:
+                  # Restore only the latest saved attempt for this graph.
+                  _, artifact_name = max(matching)
+                  selector = ["--name", artifact_name]
+              elif any(
+                  a["name"].startswith("dataset-batch-")
+                  for a in artifacts
+              ):
+                  # Compatibility with the old workflow. Batch IDs may
+                  # have changed, so locate the graph inside the downloads.
+                  selector = ["--pattern", "dataset-batch-*"]
+              else:
+                  print(
+                      f"No checkpoint for {graph_name} in run {run_id}.",
+                      flush=True,
+                  )
+                  continue
+
+              with tempfile.TemporaryDirectory() as temporary:
+                  download_dir = Path(temporary)
+
+                  subprocess.run(
+                      [
+                          "gh", "run", "download", run_id,
+                          "--repo", repo,
+                          *selector,
+                          "--dir", str(download_dir),
+                      ],
+                      check=True,
+                  )
+
+                  folders = [
+                      path for path in download_dir.rglob(graph_name)
+                      if path.is_dir()
+                  ]
+
+                  if not folders:
+                      print(
+                          f"No saved folder for {graph_name} in run {run_id}.",
+                          flush=True,
+                      )
+                      continue
+
+                  if len(folders) != 1:
+                      raise SystemExit(
+                          f"Multiple checkpoint folders found for {graph_name}"
+                      )
+
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copytree(
+                      folders[0], destination, dirs_exist_ok=True
+                  )
+
+              print(
+                  f"Restored {destination} from run {run_id}.",
+                  flush=True,
+              )
+              restored = True
+              break
+
+          if not restored:
+              print(
+                  f"Starting {graph_name} without restored state files.",
+                  flush=True,
+              )
+          PY
+
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            libmetis-dev
+          sudo apt-get install -y build-essential libmetis-dev
 
       - name: Compile executables
         run: |
@@ -96,77 +223,26 @@ jobs:
             -lmetis -mpopcnt -lm
 
       - name: Generate vertex scores
-        shell: bash
-        timeout-minutes: 315
+        timeout-minutes: 300
         env:
-          GRAPH_FILES: ${{ toJson(matrix.batch.graphs) }}
+          GRAPH_FILE: ${{ matrix.batch.graph }}
         run: |
-          python3 - <<'PY'
-          import json
-          import os
-          import subprocess
-          import time
+          python3 -u label_subgraphs.py \
+            "input/$GRAPH_FILE" \
+            raw/train \
+            --scorer ./vertex_quality \
+            --solver ./solve
 
-          graphs = json.loads(os.environ["GRAPH_FILES"])
-
-          for graph in graphs:
-              print("=" * 60, flush=True)
-              print(f"Processing graph: {graph}", flush=True)
-              print("=" * 60, flush=True)
-
-              start = time.monotonic()
-
-              try:
-                  subprocess.run(
-                      [
-                          "python3",
-                          "-u",
-                          "label_subgraphs.py",
-                          f"input/{graph}",
-                          "raw/train",
-                          "--scorer",
-                          "./vertex_quality",
-                          "--solver",
-                          "./solve",
-                      ],
-                      check=True,
-                  )
-
-                  elapsed = time.monotonic() - start
-
-                  print(
-                      f"SUCCESS: {graph} "
-                      f"completed in {elapsed:.1f}s",
-                      flush=True,
-                  )
-
-              except subprocess.CalledProcessError as error:
-                  elapsed = time.monotonic() - start
-
-                  print(
-                      f"FAILED: {graph} "
-                      f"after {elapsed:.1f}s "
-                      f"(exit code {error.returncode})",
-                      flush=True,
-                  )
-
-                  raise
-          PY
-
-      - name: Show generated files
+      - name: Show saved files
         if: always()
         run: |
-          echo "Generated files:"
-          find output -type f 2>/dev/null | head -100 || true
+          find output/raw/train -type f 2>/dev/null | head -100 || true
 
-          echo "Total files:"
-          find output -type f 2>/dev/null | wc -l || true
-
-      - name: Upload generated dataset
-        if: always()
+      - name: Upload dataset and checkpoints
+        if: ${{ always() && steps.restore.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
-          name: dataset-batch-${{ matrix.batch.id }}
+          name: dataset-${{ matrix.batch.graph }}-attempt-${{ github.run_attempt }}
           path: exact-solvers/bute-plus-plus/output/raw/train/
           retention-days: 30
           if-no-files-found: warn
